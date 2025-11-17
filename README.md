@@ -28,7 +28,7 @@ ADCSPotato expects two simple text files in the working directory:
   - The raw output of **`Certify.exe find`** redirected to a file.  
   - Example:
     ```powershell
-    Certify.exe find /vulnerable /json > Output.txt
+    Certify.exe find > Output.txt
     ```
   - ADCSPotato parses this file to map your `Users.txt` list to potential ESC1/2/3/4/7 paths.
 
