@@ -65,8 +65,9 @@ def parse_ca(raw:str):
 
 def parse_templates(raw:str):
     templates = []
-    # Split into per-template blocks
-    for block in re.split(r"\n\s*CA Name\s*:.*?\n\s*Template Name\s*:\s*", raw)[1:]:
+    # Split on Template Name lines - works for Certify v1 and v2
+    parts = re.split(r"\n\s*Template Name\s*:\s*", raw)
+    for block in parts[1:]:
         lines = block.splitlines()
         tname = lines[0].strip()
         t = {
@@ -94,9 +95,16 @@ def parse_templates(raw:str):
             t["Authorized Signatures Required"] = int(grab1("Authorized Signatures Required", "0"))
         except:
             t["Authorized Signatures Required"] = 0
-        t["msPKI-Certificate-Name-Flag"] = grab1("msPKI-Certificate-Name-Flag", "") or ""
-        t["pkiextendedkeyusage"] = grab1("pkiextendedkeyusage", "<null>") or "<null>"
-        t["mspki-certificate-application-policy"] = grab1("mspki-certificate-application-policy", "<null>") or "<null>"
+
+        # Support both Certify v1 internal names and v2 human-readable names
+        cnf = grab1("msPKI-Certificate-Name-Flag") or grab1("Certificate Name Flag") or ""
+        t["msPKI-Certificate-Name-Flag"] = cnf
+
+        eku = grab1("pkiextendedkeyusage") or grab1("Extended Key Usage") or "<null>"
+        t["pkiextendedkeyusage"] = eku
+
+        app = grab1("mspki-certificate-application-policy") or grab1("Certificate Application Policies") or "<null>"
+        t["mspki-certificate-application-policy"] = app
 
         # Enrollment Rights: scan the Enrollment block and extract principals via regex
         enroll_hdr = re.search(r"Enrollment Permissions\s*?\n\s*Enrollment Rights\s*:(.*)", block)
@@ -145,6 +153,10 @@ def parse_templates(raw:str):
 def has_auth_eku(t)->bool:
     ekus = " ".join([(t.get("pkiextendedkeyusage") or ""), (t.get("mspki-certificate-application-policy") or "")]).lower()
     return any(x in ekus for x in ["client authentication", "smart card logon", "kdc authentication"])
+
+def has_server_auth_eku(t)->bool:
+    ekus = " ".join([(t.get("pkiextendedkeyusage") or ""), (t.get("mspki-certificate-application-policy") or "")]).lower()
+    return "server authentication" in ekus
 
 def is_any_purpose(t) -> bool:
     ekus = (t.get("pkiextendedkeyusage") or "").strip().lower()
@@ -257,15 +269,39 @@ def detect_esc(ca, templates, watch_users:set):
         owner_princs = t.get("Owner Principals") or ([] if not t.get("Owner") else [t.get("Owner")])
         owner_hits = [op for op in owner_princs if (is_standard_lowpriv_group(op) or (short_name(op) in watch_users))]
         if owner_hits:
-            findings.append({"esc":"ESC4", "template": t["Template Name"], "why": f"Owner contains low-priv/watched principal(s): {', '.join(owner_hits)}"})
+            findings.append({"esc":"POTENTIAL_ESC4", "template": t["Template Name"], "why": f"Owner contains low-priv/watched principal(s): {', '.join(owner_hits)}"})
         oc_map = t.get("Object Control Map") or {}
         for cat, plist in oc_map.items():
             if cat in DANGEROUS_OC_CATS:
                 hits = [p for p in plist if (is_standard_lowpriv_group(p) or (short_name(p) in watch_users))]
                 if hits:
-                    findings.append({"esc":"ESC4", "template": t["Template Name"], "why": f"{cat} includes low-priv/watched principal(s): {', '.join(hits)}"})
+                    findings.append({"esc":"POTENTIAL_ESC4", "template": t["Template Name"], "why": f"{cat} includes low-priv/watched principal(s): {', '.join(hits)}"})
         if owner_hits and any(is_standard_lowpriv_group(p) or (short_name(p) in watch_users) for p in t["Enrollment Rights"]):
-            findings.append({"esc":"ESC4", "template": t["Template Name"], "why": "Owner includes watched principal(s) and that principal (or peers) also has enrollment rights"})
+            findings.append({"esc":"POTENTIAL_ESC4", "template": t["Template Name"], "why": "Owner includes watched principal(s) and that principal (or peers) also has enrollment rights"})
+    # --- ESC17 ---
+    # Server auth EKU + ENROLLEE_SUPPLIES_SUBJECT = attacker can get a CA-trusted cert
+    # for any hostname (e.g. wsus.domain.com) and MitM HTTPS traffic from domain clients.
+    # Checked against ALL templates regardless of enrollment rights — flag it and note who can enroll.
+    for t in templates:
+        if (
+            enrollee_supplies_subject(t)
+            and has_server_auth_eku(t)
+            and not has_auth_eku(t)          # pure Server Auth only — if it also has Client Auth it's ESC1 territory
+            and t["Authorized Signatures Required"] == 0
+        ):
+            enroll_rights = t.get("Enrollment Rights") or []
+            enroll_str = ", ".join(enroll_rights) if enroll_rights else "None listed"
+            findings.append({
+                "esc": "ESC17",
+                "template": t["Template Name"],
+                "why": (
+                    f"ENROLLEE_SUPPLIES_SUBJECT + Server Authentication EKU only. "
+                    f"Attacker can request cert for any hostname (e.g. wsus.{{}}) — "
+                    f"domain clients will trust it for HTTPS. "
+                    f"Enrollment Rights: {enroll_str}"
+                )
+            })
+
     # ESC7
     for rights, principal in ca.get("Permissions", []):
         rights_joined = " ".join(rights).lower() if isinstance(rights, (list, tuple)) else str(rights).lower()
@@ -334,6 +370,7 @@ def build_report_md(output_path, users_path, findings, ess_templates, mentions, 
     lines.append("## Notes")
     lines.append("- **ESC8** needs web enrollment/NDES checks (e.g., `http(s)://<CA>/certsrv`).")
     lines.append("- **ESC11** needs CA registry/Certify 2.0/Certipy check for `IF_ENFORCEENCRYPTICERTREQUEST`.")
+    lines.append("- **ESC17** = Server Auth + ENROLLEE_SUPPLIES_SUBJECT. Attacker can get CA-trusted cert for any hostname and MitM HTTPS (e.g. WSUS). Not flagged by standard certipy/Certify — manual or this script only.")
     return "\n".join(lines)
 
 def main():
